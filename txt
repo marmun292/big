@@ -1,0 +1,73 @@
+Step 0 — set up (first 30 seconds). Open two terminals. One is your work terminal, one is scratch. Make a working dir so nothing gets lost and you can re-hash/re-grep cleanly:
+
+mkdir ~/work && cd ~/work && cp /path/to/griffin.png .
+
+Step 1 — identify and read the metadata. Run these and actually read the output, don't skim:
+
+file griffin.png
+identify -verbose griffin.png | less
+exiftool griffin.png
+pngcheck -vt griffin.png
+strings -n 8 griffin.png | less
+
+You're asking: what's the real size/mode? Any text/comment fields? Any weird or extra PNG chunks, or data after IEND? If something jumps out here, that's your lead, follow it.
+
+Step 2 — check for appended/embedded files.
+
+binwalk griffin.png
+binwalk -e griffin.png
+
+If it extracts something, go look at what came out.
+
+Step 3 — the decision-maker: pixel histogram. This is the step that tells you which branch you're on, so don't skip it:
+
+python3 - <<'PY'
+from PIL import Image
+from collections import Counter
+im = Image.open("griffin.png")
+print("mode", im.mode, "size", im.size)
+print(Counter(im.convert("RGB").getdata()).most_common(40))
+PY
+
+Then you make the call based on what you see:
+
+Only a few values, or values clustered right next to normal ones → data's in the low bits → go to Step 4.
+Totally normal spread of values → probably not LSB at all → pivot to metadata/appended/comparison (Steps 1, 2, 6).
+
+Step 4 — bitplanes (if the histogram looked suspicious).
+
+python3 - <<'PY'
+from PIL import Image
+import numpy as np
+im = np.array(Image.open("griffin.png").convert("L"))
+for b in range(8):
+    Image.fromarray((((im>>b)&1)*255).astype('uint8')).save(f"bit{b}.png")
+print("saved bit0..bit7")
+PY
+xdg-open bit0.png
+
+Look at each. Hidden pictures/QRs/text usually show in bit0 or bit1. For color, split channels first (convert ... -channel R -separate R.png, etc.) and do planes per channel.
+
+Step 5 — if the bits clearly hold data but extraction is garbage, it's a read-order puzzle. Write a tiny extractor and try one traversal theory at a time (row vs column major, reversed bits/pixels, BGR, every-Nth, or an order seeded by a number/word in the challenge text):
+
+python3 - <<'PY'
+from PIL import Image
+import numpy as np, re
+a = np.array(Image.open("griffin.png").convert("L"))
+bits = (a.flatten() & 1)        # <-- change this line per theory
+def tb(b,msb=True):
+    b=b[:len(b)//8*8].reshape(-1,8)
+    if not msb: b=b[:,::-1]
+    return (b*(1<<np.arange(8)[::-1])).sum(1).astype('uint8').tobytes()
+d=tb(bits)
+print(re.findall(rb"tribectf\{[ -~]{1,80}\}", d))
+print(d[:120])
+PY
+
+Swap the bits = ... line, re-run, stop when tribectf{ or readable text appears.
+
+Step 6 — comparison against a clean original (strong line given the "something's off about this griffin" framing). Source a reference image via the web (allowed, just never upload the challenge file), then:
+
+convert original.png griffin.png -compose difference -composite diff.png
+convert diff.png -auto-level diffvis.png
+xdg-open diffvis.png
